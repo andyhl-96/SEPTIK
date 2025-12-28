@@ -40,10 +40,10 @@ def load_robot(urdf_path):
     robot_coll = pk.collision.RobotCollision.from_urdf(urdf)
     return urdf, robot, robot_coll
 
-def compute_points(func, num):
+def compute_points(func, T, num):
     ts = jnp.linspace(0, 1, num)
-    bat_func = jax.vmap(func, in_axes=(0))
-    return bat_func(ts)
+    bat_func = jax.vmap(func, in_axes=(0, None))
+    return bat_func(ts, T)
 
 @partial(jax.jit, static_argnames=['f'])
 def jacobi_proj(f, steps, q, robot):
@@ -221,6 +221,10 @@ def eval_hermite_poly(coeffs, t):
     return powers @ coeffs
 
 # measure difference between computed path and true path
-def compute_cost():
-
-    pass
+def compute_cost(coeffs, f, robot, num_points, t0, t1):
+    error = 0
+    times = np.linspace(t0, t1, num_points)
+    for i in range(num_points):
+        q = eval_hermite_poly(coeffs, times[i])
+        ee_pose_pred = robot.forward_kinematics(q)
+        ee_pose_true = f(times[i])
