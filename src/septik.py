@@ -238,12 +238,9 @@ def eval_hermite_poly(coeffs, t, order):
     fact2 = factorial(ones * mult2[:, np.newaxis])
     fact1 = fact1.at[0:order].set(jnp.zeros(fact1[0:order].shape))
     coeffs = coeffs * (fact1 / fact2)
-    print(fact1)
-    print(fact2)
 
     # build powers (nt, deg+1)
     powers = jnp.stack([t_a ** (jnp.max(jnp.array([k - order, 0]))) for k in range(0, deg + 1)], axis=1)
-    print(coeffs)
     return powers @ coeffs
 
 # measure difference between computed path and true path
