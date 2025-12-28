@@ -1,9 +1,11 @@
 import jax
 import jax.numpy as jnp
 from functools import partial
+from networkx import fiedler_vector
 import yourdfpy
 import pyroki as pk
 import numpy as np
+from jax.scipy.special import factorial
 
 primes = jnp.array([
         2,
@@ -95,12 +97,24 @@ def jacobi_stein_proj(f, outer, inner, X, robot):
     X_k = jax.lax.fori_loop(0, outer, loop, X)
     return X_k
 
-def find_best_sequence(layers):
+def find_best_sequence(layers, T, f, robot, num_points):
     # T[i, j] minimum cost to get to layer i node j
     # T[i, j] = min over k {T[i - 1, k] + c(k, j)}
+    delta_t = T / (len(layers) - 1)
     def compute_candidates(i, j, T):
+        t0 = (i - 1) * delta_t
+        t1 = i * delta_t
+        # need bc for all polys
+        bcs = []
+        for x in range(len(layers[0])):
+            for y in range(len(layers[0])):
+                bcs.append([layers[i - 1][x], layers[i][y], ])
         cands = jnp.zeros(len(layers[0]))
-        cands += T[i - 1, :] # + cost  TODO
+        if i == len(layers) - 1:
+            coeffs = compute_hermite_poly5(bc, t0, t1)
+        else:
+            coeffs = compute_hermite_poly4(bc, t0, t1)
+        cands += T[i - 1, :] + compute_cost(coeffs, f, robot, num_points, t0, t1, T)
         return cands
     T = jnp.ones((len(layers)), len(layers[0])) * jnp.inf
     T[0, :] = 0
@@ -206,8 +220,8 @@ def compute_hermite_poly5(bc, t0, t1):
     return coeffs
 
 
-@jax.jit
-def eval_hermite_poly(coeffs, t):
+# @partial(jax.jit, static_argnames=['order'])
+def eval_hermite_poly(coeffs, t, order):
     """Evaluate monomial Hermite polynomial(s) given ``coeffs`` at times ``t``.
 
     ``coeffs`` shape: (deg+1, n_dof). ``t`` may be scalar or 1D array. Returns
@@ -215,16 +229,30 @@ def eval_hermite_poly(coeffs, t):
     """
     coeffs = jnp.asarray(coeffs)
     t_a = jnp.atleast_1d(t)
-    degp1 = coeffs.shape[0]
+    deg = coeffs.shape[0] - 1
+    ones = jnp.ones(coeffs.shape)
+    mult1 = jnp.arange(0, deg + 1)
+    mult2 = jnp.arange(-order, deg - order + 1)
+    mult2 = mult2.at[0:order + 1].set(0.0)
+    fact1 = factorial(ones * mult1[:, np.newaxis])
+    fact2 = factorial(ones * mult2[:, np.newaxis])
+    fact1 = fact1.at[0:order].set(jnp.zeros(fact1[0:order].shape))
+    coeffs = coeffs * (fact1 / fact2)
+    print(fact1)
+    print(fact2)
+
     # build powers (nt, deg+1)
-    powers = jnp.stack([t_a ** k for k in range(degp1)], axis=1)
+    powers = jnp.stack([t_a ** (jnp.max(jnp.array([k - order, 0]))) for k in range(0, deg + 1)], axis=1)
+    print(coeffs)
     return powers @ coeffs
 
 # measure difference between computed path and true path
-def compute_cost(coeffs, f, robot, num_points, t0, t1):
+def compute_cost(coeffs, f, robot, num_points, t0, t1, T):
     error = 0
     times = np.linspace(t0, t1, num_points)
     for i in range(num_points):
         q = eval_hermite_poly(coeffs, times[i])
         ee_pose_pred = robot.forward_kinematics(q)
-        ee_pose_true = f(times[i])
+        ee_pose_true = f(times[i], T)
+        error += jnp.linalg.norm(ee_pose_true - ee_pose_pred)
+    return error

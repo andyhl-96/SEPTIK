@@ -54,7 +54,12 @@ coeffs = septik.compute_hermite_poly4([layers[0][0], layers[1][0], jnp.zeros(7),
 ts = time.perf_counter()
 coeffs = septik.compute_hermite_poly4([layers[0][0], layers[1][0], jnp.zeros(7), jnp.zeros(7), jnp.zeros(7)], 0.0, 1)
 tf = time.perf_counter()
+septik.eval_hermite_poly(coeffs, 1.0, 0)
 print(tf - ts)
+
+print(coeffs)
+print(septik.eval_hermite_poly(coeffs, 1.0, 0))
+print(layers[1][0])
 exit()
 
 while True:
