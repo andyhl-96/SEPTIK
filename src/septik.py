@@ -62,8 +62,46 @@ def jacobi_proj(f, steps, q, robot):
     return q
 
 @jax.jit
+def jacobi_ik(x, steps, q, robot):
+    f = lambda qk, rob: jnp.linalg.norm(x - rob.forward_kinematics(qk)[-1])
+    J = jax.jacobian(f, 0)
+    def body(i, val):
+        qk = val
+        J_dag = jnp.linalg.pinv(jnp.array([J(qk, robot)]))
+        dx = jnp.array([-f(qk, robot)])
+        dq = J_dag @ dx
+        return qk + dq
+    initial = q
+    q = jax.lax.fori_loop(0, steps, body, initial)
+    return q
+
+@jax.jit
 def rbf(x0, x1, n):
     return jnp.exp(-jnp.dot(x0 - x1, x0 - x1) / n)
+
+@jax.jit
+def stein_ik(x, k, X, robot):
+    n = len(X)
+    # function to compute single xj in the sum
+    f = lambda q, rob: jnp.linalg.norm(x - rob.forward_kinematics(q)[-1])
+    def update(X_j, x):
+        def logp(x):
+            return jnp.log(jnp.exp(-jnp.dot(f(x, robot), f(x, robot))))
+        rbf_batch = jax.vmap(rbf, in_axes=(0, None, None))
+        logp_grad = jax.grad(logp)
+        rbf_grad = jax.grad(rbf, argnums=0)
+        rbf_grad_batch = jax.vmap(rbf_grad, in_axes=(0, None, None))
+        logp_grad_batch = jax.vmap(logp_grad, in_axes=(0))
+        r = jnp.linalg.matmul(rbf_batch(X_j, x, 1 / n).T, logp_grad_batch(X_j)) + jnp.linalg.matmul(jnp.ones(n), rbf_grad_batch(X_j, x, 1 / n))
+        return r
+    # X_k = X
+    def loop1(i, X_k):
+        update_batch = jax.vmap(update, in_axes=(None, 0))
+        X_del = update_batch(X_k, X_k) / n
+        return X_k + 1 / n * X_del
+    initial = X
+    X_k = jax.lax.fori_loop(0, k, loop1, initial)
+    return X_k
 
 @partial(jax.jit, static_argnames=['f'])
 def stein_proj(f, k, X, robot):
@@ -83,7 +121,7 @@ def stein_proj(f, k, X, robot):
     def loop1(i, X_k):
         update_batch = jax.vmap(update, in_axes=(None, 0))
         X_del = update_batch(X_k, X_k) / n
-        return X_k + jnp.log2(n) / n * X_del
+        return X_k + 1 / n * X_del
     initial = X
     X_k = jax.lax.fori_loop(0, k, loop1, initial)
     return X_k
@@ -93,7 +131,17 @@ def jacobi_stein_proj(f, outer, inner, X, robot):
     jacobi_batch = jax.vmap(jacobi_proj, in_axes=(None, None, 0, None))
     def loop(i, proj):
         proj = stein_proj(f, inner, proj, robot)
-        proj = jacobi_batch(f, 2 * inner, proj, robot)
+        proj = jacobi_batch(f, inner, proj, robot)
+        return proj
+    X_k = jax.lax.fori_loop(0, outer, loop, X)
+    return X_k
+
+@jax.jit
+def jacobi_stein_ik(x, outer, inner, X, robot):
+    jacobi_batch = jax.vmap(jacobi_ik, in_axes=(None, None, 0, None))
+    def loop(i, proj):
+        proj = stein_ik(x, inner, proj, robot)
+        proj = jacobi_batch(x, inner, proj, robot)
         return proj
     X_k = jax.lax.fori_loop(0, outer, loop, X)
     return X_k
@@ -102,7 +150,7 @@ def find_best_sequence(layers, T, f, robot, num_points):
     # T[i, j] minimum cost to get to layer i node j
     # T[i, j] = min over k {T[i - 1, k] + c(k, j)}
     ts = np.linspace(0, T, len(layers))
-    dof = len(layers[0][0])
+    dof = len(layers[0, 0])
     poly5_batch = jax.vmap(compute_hermite_poly5, in_axes=(0, None, None))
     batch_cost = jax.vmap(compute_cost, in_axes=(0, None, None, None, None, None, None))
     def compute_candidates(i, j, C):
@@ -112,7 +160,7 @@ def find_best_sequence(layers, T, f, robot, num_points):
         # vectorized construction of boundary conditions for all nodes in previous layer
         # p0s: (n_nodes, dof), p1: (dof,)
         p0s = jnp.asarray(layers[i - 1])
-        p1 = jnp.asarray(layers[i][j])
+        p1 = jnp.asarray(layers[i, j])
         n_nodes = p0s.shape[0]
         zeros = jnp.zeros((n_nodes, dof))
         p1s = jnp.broadcast_to(p1, (n_nodes, dof))
@@ -127,12 +175,19 @@ def find_best_sequence(layers, T, f, robot, num_points):
     BT = np.ones(((len(layers)), len(layers[0]))) * -1
     for i in range(1, len(layers)):
         # vectorize over configs
-        for j in range(len(layers[0])):
-            cands = compute_candidates(i, j, C)
-            min = jnp.min(cands)
-            argmin = jnp.argmin(cands)
-            C[i, j] = min
-            BT[i, j] = argmin
+        compute_batch = jax.vmap(compute_candidates, in_axes=(None, 0, None))
+        configs = jnp.arange(0, len(layers[0]))
+        cands = compute_batch(i, configs, C)
+        mins = jnp.min(cands, axis=1)
+        argmins = jnp.argmin(cands, axis=1)
+        C[i, :] = mins
+        BT[i, :] = argmins
+        # for j in range(len(layers[0])):
+        #     cands = compute_candidates(i, j, C)
+        #     min = jnp.min(cands)
+        #     argmin = jnp.argmin(cands)
+        #     C[i, j] = min
+        #     BT[i, j] = argmin
     return C, BT
 
 # number of boundary_conds should completely determine hermite poly of degree deg
@@ -269,6 +324,7 @@ def compute_cost(coeffs, f, robot, num_points, t0, t1, T):
 
 def compute_path(layers, f, robot, T):
     C, BT = find_best_sequence(layers, T, f, robot, 32)
+    print("(SEPTIK) Best sequence found", flush=True)
     waypts = []
     smooth_path = []
     ts = np.linspace(0, T, len(layers))
